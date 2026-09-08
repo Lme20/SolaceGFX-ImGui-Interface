@@ -6,7 +6,7 @@
 
 namespace solace::asset_io
 {
-std::filesystem::path asset_directory(const wchar_t* name, const wchar_t* environment_key);
+std::filesystem::path asset_directory(const char* name, const char* environment_key);
 
 std::vector<std::filesystem::path> image_files(const std::filesystem::path& directory);
 

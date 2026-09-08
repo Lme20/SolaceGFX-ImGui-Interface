@@ -1,4 +1,4 @@
-name: Windows build
+name: Build
 
 on:
   push:
@@ -12,33 +12,50 @@ permissions:
 
 jobs:
   build:
-    runs-on: windows-2022
-    timeout-minutes: 20
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
+        os: [windows-2022, macos-14]
         configuration: [Debug, Release]
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
-
       - name: Verify formatting
+        if: runner.os == 'Windows'
         shell: pwsh
         run: .\scripts\format-source.ps1 -Check
 
-      - name: Build
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: build/_deps
+          key: deps-${{ runner.os }}-${{ matrix.configuration }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: .\scripts\build.ps1 -Configuration ${{ matrix.configuration }}
 
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
+      - name: Build (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.configuration }}
+          cmake --build build
+
       - name: Package release
-        if: matrix.configuration == 'Release'
+        if: runner.os == 'Windows' && matrix.configuration == 'Release'
         shell: pwsh
         run: .\scripts\package-release.ps1 -Version 0.1.0 -SkipBuild -ValidateStartup
 
       - name: Upload release package
-        if: matrix.configuration == 'Release'
+        if: runner.os == 'Windows' && matrix.configuration == 'Release'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: Solace-0.1.0-win64

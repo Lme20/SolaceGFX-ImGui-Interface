@@ -2,12 +2,9 @@
 
 #include "imgui.h"
 
-struct ID3D11Device;
-struct ID3D11DeviceContext;
-
 namespace solace::rounded_panel
 {
-[[nodiscard]] bool init(ID3D11Device* device, ID3D11DeviceContext* context);
+[[nodiscard]] bool init();
 void shutdown();
 
 // Draws an analytic rounded silhouette with an 8x8 filtered subpixel edge.

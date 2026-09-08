@@ -3,14 +3,11 @@
 
 #include <filesystem>
 
-struct ID3D11Device;
-struct ID3D11DeviceContext;
-
 namespace solace::avatars
 {
 void load(const std::filesystem::path& people_directory,
-          const std::filesystem::path& logo_directory, const std::filesystem::path& brand_directory,
-          ID3D11Device* device, ID3D11DeviceContext* context);
+          const std::filesystem::path& logo_directory,
+          const std::filesystem::path& brand_directory);
 void shutdown();
 
 ImTextureID me();

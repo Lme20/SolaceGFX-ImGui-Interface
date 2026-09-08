@@ -1,6 +1,6 @@
 #include "assets/images.h"
 #include "assets/asset_io.h"
-#include "graphics/dx11_helpers.h"
+#include "graphics/gfx_helpers.h"
 
 #include "imgui_internal.h"
 
@@ -40,7 +40,7 @@ struct loader
     std::atomic<int> next{0};
     std::mutex mutex;
     std::vector<decoded> finished;
-    std::vector<Microsoft::WRL::ComPtr<ID3D11ShaderResourceView>> views;
+    std::vector<gfx::texture> views;
     std::vector<texture> textures;
     std::atomic<bool> quit{false};
     bool started = false;
@@ -173,11 +173,9 @@ void load_folder(const std::filesystem::path& directory, const options& opts)
         l.workers.emplace_back(run);
 }
 
-void update(ID3D11Device* device, ID3D11DeviceContext* context)
+void update()
 {
     loader& l = store();
-    if (device == nullptr || context == nullptr)
-        return;
 
     std::vector<decoded> pending;
     {
@@ -187,15 +185,13 @@ void update(ID3D11Device* device, ID3D11DeviceContext* context)
 
     for (const decoded& d : pending)
     {
-
-        auto view = dx11::create_rgba_texture(device, context, d.rgba.data(),
-                                              static_cast<unsigned int>(d.width),
-                                              static_cast<unsigned int>(d.height));
-        if (!view)
+        gfx::texture view = gfx::create_rgba_texture(
+            d.rgba.data(), static_cast<unsigned int>(d.width), static_cast<unsigned int>(d.height));
+        if (!view.valid())
             continue;
 
         texture t;
-        t.id = reinterpret_cast<ImTextureID>(view.Get());
+        t.id = view.id();
         t.width = d.width;
         t.height = d.height;
         t.name = d.name;

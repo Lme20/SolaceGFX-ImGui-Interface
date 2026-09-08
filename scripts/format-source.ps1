@@ -41,7 +41,7 @@ function Find-ClangFormat {
 $clangFormat = Find-ClangFormat
 $targets = Get-ChildItem -LiteralPath (Join-Path $repositoryRoot "src") -Recurse -File |
     Where-Object {
-        $_.Extension -in ".cpp", ".h" -and
+        $_.Extension -in ".cpp", ".h", ".mm" -and
         $_.FullName -notlike "*\src\generated\*"
     } |
     Sort-Object FullName

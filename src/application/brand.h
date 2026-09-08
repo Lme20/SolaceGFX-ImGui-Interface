@@ -33,7 +33,7 @@ constexpr credit_profile placeholder{
 } // namespace profiles
 
 // Select the visible creator profile.
-constexpr const credit_profile& active = profiles::pondot;
+inline constexpr const credit_profile& active = profiles::pondot;
 
 constexpr const char* product = solace::product_info::name;
 

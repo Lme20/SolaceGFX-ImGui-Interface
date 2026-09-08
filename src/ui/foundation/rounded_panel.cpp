@@ -1,5 +1,5 @@
 #include "ui/foundation/rounded_panel.h"
-#include "graphics/dx11_helpers.h"
+#include "graphics/gfx_helpers.h"
 
 #include <algorithm>
 
@@ -26,60 +26,7 @@ struct alignas(16) shader_constants
 static_assert(sizeof(float4) == 16);
 static_assert(sizeof(shader_constants) == 64);
 
-dx11::pixel_shader_pass g_renderer;
-
-constexpr char k_pixel_shader[] = R"HLSL(
-cbuffer RoundedPanelParams : register(b0)
-{
-    float4 u_bounds;
-    float4 u_fill;
-    float4 u_shape;
-    float4 u_viewport_transform;
-};
-
-struct PS_INPUT
-{
-    float4 pos : SV_POSITION;
-};
-
-float rounded_box(float2 sample_position, float2 half_size, float radius)
-{
-    float2 q = abs(sample_position) - half_size + radius;
-    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - radius;
-}
-
-float4 main(PS_INPUT input) : SV_Target
-{
-    float2 inv_framebuffer_scale = u_viewport_transform.zw;
-    float2 pixel = input.pos.xy * inv_framebuffer_scale + u_viewport_transform.xy;
-    float2 center = (u_bounds.xy + u_bounds.zw) * 0.5;
-    float2 half_size = max((u_bounds.zw - u_bounds.xy) * 0.5, 0.0);
-    float radius = min(max(u_shape.x, 0.0), min(half_size.x, half_size.y));
-    float center_distance = rounded_box(pixel - center, half_size, radius);
-
-    // Most pixels are nowhere near the one-pixel silhouette. Keep those fast
-    // and supersample only the narrow outer band.
-    if (center_distance > 1.0)
-        return 0.0;
-    if (center_distance < -1.0)
-        return u_fill;
-
-    float coverage_samples = 0.0;
-    float sample_feather = 0.5 * max(inv_framebuffer_scale.x, inv_framebuffer_scale.y);
-    [unroll] for (int y = 0; y < 8; ++y)
-    {
-        [unroll] for (int x = 0; x < 8; ++x)
-        {
-            float2 offset = (float2(x, y) + 0.5) * (1.0 / 8.0) - 0.5;
-            float distance = rounded_box(pixel + offset * inv_framebuffer_scale - center,
-                half_size, radius);
-            coverage_samples += saturate(0.5 - distance / sample_feather);
-        }
-    }
-
-    return float4(u_fill.rgb, u_fill.a * coverage_samples * (1.0 / 64.0));
-}
-)HLSL";
+gfx::pixel_shader_pass g_renderer;
 
 float4 to_float4(ImU32 color)
 {
@@ -104,10 +51,10 @@ void draw_fallback(ImDrawList* draw_list, const ImVec2& min, const ImVec2& max, 
 }
 } // namespace
 
-bool init(ID3D11Device* device, ID3D11DeviceContext* context)
+bool init()
 {
-    return g_renderer.initialize(device, context, k_pixel_shader, sizeof(k_pixel_shader) - 1,
-                                 "rounded panel shader", sizeof(shader_constants), false);
+    return g_renderer.initialize("fs_rounded_panel", "rounded panel shader",
+                                 sizeof(shader_constants), /*sampler_count=*/0);
 }
 
 void shutdown()

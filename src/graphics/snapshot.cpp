@@ -1,9 +1,5 @@
 #include "graphics/snapshot.h"
-
-#include <d3d11.h>
-#include <wrl/client.h>
-
-#include <utility>
+#include "graphics/imgui_impl_bgfx.h"
 
 namespace solace::snapshot
 {
@@ -11,178 +7,141 @@ namespace
 {
 struct texture_copy
 {
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> texture;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> view;
-    UINT width = 0;
-    UINT height = 0;
-    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    bgfx::TextureHandle handle = BGFX_INVALID_HANDLE;
+    unsigned width = 0, height = 0;
+    bool valid = false;
 
-    void reset()
+    bool ensure(unsigned w, unsigned h)
     {
-        view.Reset();
-        texture.Reset();
-        width = height = 0;
-        format = DXGI_FORMAT_UNKNOWN;
-    }
-
-    bool ensure(ID3D11Device* device, const D3D11_TEXTURE2D_DESC& source)
-    {
-        if (texture && width == source.Width && height == source.Height && format == source.Format)
+        if (bgfx::isValid(handle) && width == w && height == h)
             return true;
-
-        reset();
-
-        D3D11_TEXTURE2D_DESC copy = source;
-        copy.Usage = D3D11_USAGE_DEFAULT;
-        copy.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-        copy.CPUAccessFlags = 0;
-        copy.MiscFlags = 0;
-        copy.MipLevels = 1;
-        copy.SampleDesc.Count = 1;
-        copy.SampleDesc.Quality = 0;
-
-        Microsoft::WRL::ComPtr<ID3D11Texture2D> next_texture;
-        if (FAILED(device->CreateTexture2D(&copy, nullptr, &next_texture)))
-            return false;
-
-        D3D11_SHADER_RESOURCE_VIEW_DESC view_description{};
-        view_description.Format = copy.Format;
-        view_description.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-        view_description.Texture2D.MipLevels = 1;
-
-        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> next_view;
-        if (FAILED(device->CreateShaderResourceView(next_texture.Get(), &view_description,
-                                                    &next_view)))
-            return false;
-
-        texture = std::move(next_texture);
-        view = std::move(next_view);
-        width = source.Width;
-        height = source.Height;
-        format = source.Format;
-        return true;
+        release();
+        handle = bgfx::createTexture2D(static_cast<uint16_t>(w), static_cast<uint16_t>(h), false, 1,
+                                       bgfx::TextureFormat::RGBA8,
+                                       BGFX_TEXTURE_BLIT_DST | BGFX_SAMPLER_U_CLAMP |
+                                           BGFX_SAMPLER_V_CLAMP);
+        width = w;
+        height = h;
+        return bgfx::isValid(handle);
+    }
+    void release()
+    {
+        if (bgfx::isValid(handle))
+            bgfx::destroy(handle);
+        handle = BGFX_INVALID_HANDLE;
+        valid = false;
     }
 };
 
-texture_copy g_snapshot;
+bgfx::TextureHandle g_scene = BGFX_INVALID_HANDLE;
+unsigned g_width = 0, g_height = 0;
+bgfx::ViewId g_composite_view = 0;
 texture_copy g_backdrop;
-bool g_requested = false;
-bool g_ready = false;
-bool g_backdrop_ready = false;
+texture_copy g_snapshot;
+bool g_snapshot_requested = false;
 
-ID3D11Device* g_device = nullptr;
-ID3D11DeviceContext* g_context = nullptr;
-IDXGISwapChain* g_swap_chain = nullptr;
-
+// Runs inside imgui_bgfx::render_draw_data. Everything submitted lives in the
+// current view; move on to the next view and blit the RT at the start of it, so the
+// copy contains exactly what was drawn before this call.
 void backdrop_callback(const ImDrawList*, const ImDrawCmd*)
 {
-    if (!g_device || !g_context || !g_swap_chain)
+    if (!bgfx::isValid(g_scene) || !g_backdrop.ensure(g_width, g_height))
         return;
+    const bgfx::ViewId view = imgui_bgfx::split_view();
 
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> backbuffer;
-    if (FAILED(g_swap_chain->GetBuffer(0, IID_PPV_ARGS(&backbuffer))))
-        return;
+    bgfx::TextureRegion dst;
+    dst.init(g_backdrop.handle, 0, 0, static_cast<uint16_t>(g_width),
+             static_cast<uint16_t>(g_height));
 
-    D3D11_TEXTURE2D_DESC description{};
-    backbuffer->GetDesc(&description);
-    if (!g_backdrop.ensure(g_device, description))
-        return;
+    bgfx::TextureRegion src;
+    src.init(g_scene, 0, 0, static_cast<uint16_t>(g_width), static_cast<uint16_t>(g_height));
 
-    Microsoft::WRL::ComPtr<ID3D11RenderTargetView> render_target;
-    Microsoft::WRL::ComPtr<ID3D11DepthStencilView> depth_stencil;
-    g_context->OMGetRenderTargets(1, &render_target, &depth_stencil);
-    g_context->OMSetRenderTargets(0, nullptr, nullptr);
-    g_context->CopyResource(g_backdrop.texture.Get(), backbuffer.Get());
+    bgfx::blit(view, dst, src);
 
-    ID3D11RenderTargetView* target = render_target.Get();
-    g_context->OMSetRenderTargets(1, &target, depth_stencil.Get());
-    g_backdrop_ready = true;
+    g_backdrop.valid = true;
 }
 } // namespace
 
-void attach(ID3D11Device* device, ID3D11DeviceContext* context, IDXGISwapChain* swap_chain)
+void attach(bgfx::TextureHandle scene_rt, unsigned width, unsigned height,
+            bgfx::ViewId composite_view)
 {
-    g_device = device;
-    g_context = context;
-    g_swap_chain = swap_chain;
+    g_scene = scene_rt;
+    g_width = width;
+    g_height = height;
+    g_composite_view = composite_view;
 }
 
-void capture_backdrop(ImDrawList* draw_list)
+void capture_backdrop(ImDrawList* dl)
 {
-    if (!draw_list || !g_device)
+    if (!dl)
         return;
-
-    draw_list->AddCallback(backdrop_callback, nullptr);
-    draw_list->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
+    dl->AddCallback(backdrop_callback, nullptr);
+    dl->AddCallback(ImDrawCallback_ResetRenderState, nullptr);
 }
 
 void invalidate_backdrop()
 {
-    g_backdrop_ready = false;
-    g_backdrop.reset();
+    g_backdrop.release();
 }
-
 bool backdrop_ready()
 {
-    return g_backdrop_ready && g_backdrop.view;
+    return g_backdrop.valid;
 }
-
 ImTextureID backdrop()
 {
-    return g_backdrop.view ? reinterpret_cast<ImTextureID>(g_backdrop.view.Get())
-                           : ImTextureID_Invalid;
+    return imgui_bgfx::to_texture_id(g_backdrop.handle);
+}
+bgfx::TextureHandle backdrop_handle()
+{
+    return g_backdrop.handle;
 }
 
 void request()
 {
-    g_requested = true;
-    g_ready = false;
+    g_snapshot_requested = true;
 }
-
 bool ready()
 {
-    return g_ready && g_snapshot.view;
+    return g_snapshot.valid;
 }
-
 ImTextureID texture()
 {
-    return g_snapshot.view ? reinterpret_cast<ImTextureID>(g_snapshot.view.Get())
-                           : ImTextureID_Invalid;
+    return imgui_bgfx::to_texture_id(g_snapshot.handle);
+}
+bgfx::TextureHandle texture_handle()
+{
+    return g_snapshot.handle;
+}
+
+void poll()
+{
+    if (!g_snapshot_requested || !bgfx::isValid(g_scene))
+        return;
+    g_snapshot_requested = false;
+    if (!g_snapshot.ensure(g_width, g_height))
+        return;
+
+    // Blits on the composite view run before its draws
+    bgfx::TextureRegion dst;
+    dst.init(g_snapshot.handle, 0, 0, static_cast<uint16_t>(g_width),
+             static_cast<uint16_t>(g_height));
+
+    bgfx::TextureRegion src;
+    src.init(g_scene, 0, 0, static_cast<uint16_t>(g_width), static_cast<uint16_t>(g_height));
+
+    bgfx::blit(g_composite_view, dst, src);
+
+    g_snapshot.valid = true;
 }
 
 void release()
 {
-    g_snapshot.reset();
-    g_ready = false;
-    g_requested = false;
+    g_snapshot.release();
 }
-
 void shutdown()
 {
-    g_snapshot.reset();
-    g_backdrop.reset();
-    g_requested = g_ready = g_backdrop_ready = false;
-    g_device = nullptr;
-    g_context = nullptr;
-    g_swap_chain = nullptr;
-}
-
-void poll(ID3D11Device* device, ID3D11DeviceContext* context, IDXGISwapChain* swap_chain)
-{
-    if (!g_requested || !device || !context || !swap_chain)
-        return;
-    g_requested = false;
-
-    Microsoft::WRL::ComPtr<ID3D11Texture2D> backbuffer;
-    if (FAILED(swap_chain->GetBuffer(0, IID_PPV_ARGS(&backbuffer))))
-        return;
-
-    D3D11_TEXTURE2D_DESC description{};
-    backbuffer->GetDesc(&description);
-    if (!g_snapshot.ensure(device, description))
-        return;
-
-    context->CopyResource(g_snapshot.texture.Get(), backbuffer.Get());
-    g_ready = true;
+    g_snapshot.release();
+    g_backdrop.release();
+    g_scene = BGFX_INVALID_HANDLE;
 }
 } // namespace solace::snapshot

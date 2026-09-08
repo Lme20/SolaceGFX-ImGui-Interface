@@ -2,12 +2,21 @@
 
 #include "core/environment.h"
 
-#include <windows.h>
-
 #include <algorithm>
-#include <cwctype>
+#include <cctype>
 #include <fstream>
 #include <limits>
+#include <vector>
+
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#endif
+
+// TODO: executable is in Solace.app/Contents/MacOS/ for MACOSX; for distribution it should be at
+// Contents/Resources
 
 namespace solace::asset_io
 {
@@ -21,6 +30,7 @@ std::filesystem::path executable_directory()
         return std::filesystem::current_path(error);
     };
 
+#if defined(_WIN32)
     std::vector<wchar_t> value(512);
     for (;;)
     {
@@ -32,39 +42,70 @@ std::filesystem::path executable_directory()
             return std::filesystem::path(value.data(), value.data() + written).parent_path();
         if (value.size() >= 32768)
             return current_directory();
-
         value.resize(value.size() * 2);
     }
+#elif defined(__APPLE__)
+    std::uint32_t size = 0;
+    _NSGetExecutablePath(nullptr, &size);
+    std::vector<char> value(size + 1);
+    if (_NSGetExecutablePath(value.data(), &size) != 0)
+        return current_directory();
+    std::error_code error;
+    const std::filesystem::path resolved = std::filesystem::canonical(value.data(), error);
+    return error ? current_directory() : resolved.parent_path();
+#else
+    std::error_code error;
+    const std::filesystem::path resolved = std::filesystem::read_symlink("/proc/self/exe", error);
+    return error ? current_directory() : resolved.parent_path();
+#endif
+}
+
+std::string lowercase_extension(const std::filesystem::path& path)
+{
+    std::string extension = path.extension().string();
+    std::transform(extension.begin(), extension.end(), extension.begin(),
+                   [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+    return extension;
 }
 
 bool is_image(const std::filesystem::path& path)
 {
-    std::wstring extension = path.extension().wstring();
-    std::transform(extension.begin(), extension.end(), extension.begin(),
-                   [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
-    return extension == L".jpg" || extension == L".jpeg" || extension == L".png" ||
-           extension == L".bmp";
+    const std::string extension = lowercase_extension(path);
+    return extension == ".jpg" || extension == ".jpeg" || extension == ".png" ||
+           extension == ".bmp";
 }
 } // namespace
 
-std::filesystem::path asset_directory(const wchar_t* name, const wchar_t* environment_key)
+std::filesystem::path asset_directory(const char* name, const char* environment_key)
 {
     if (const std::filesystem::path configured = solace::environment::value(environment_key);
         !configured.empty())
         return configured;
 
     const std::filesystem::path executable = executable_directory();
+
+#if defined(__APPLE__)
+    // Bundle layout: Contents/MacOS/Solace to Contents/Resources/assets/<name>
+    {
+        const std::filesystem::path bundled =
+            executable.parent_path() / "Resources" / "assets" / name;
+        std::error_code error;
+        if (std::filesystem::is_directory(bundled, error))
+            return bundled;
+    }
+#endif
+
     std::filesystem::path base = executable;
     for (int depth = 0; depth < 3; ++depth)
     {
-        const std::filesystem::path candidate = base / L"assets" / name;
+        const std::filesystem::path candidate = base / "assets" / name;
         std::error_code error;
         if (std::filesystem::is_directory(candidate, error))
             return candidate;
         base = base.parent_path();
     }
 
-    return executable / L"assets" / name;
+    return executable / "assets" / name;
 }
 
 std::vector<std::filesystem::path> image_files(const std::filesystem::path& directory)

@@ -5,9 +5,6 @@
 #include <string>
 #include <vector>
 
-struct ID3D11Device;
-struct ID3D11DeviceContext;
-
 namespace solace::images
 {
 struct texture
@@ -28,7 +25,7 @@ struct options
 
 void load_folder(const std::filesystem::path& directory, const options& opts = options());
 
-void update(ID3D11Device* device, ID3D11DeviceContext* context);
+void update();
 
 const std::vector<texture>& ready();
 

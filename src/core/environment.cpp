@@ -2,9 +2,8 @@
 
 #include "core/product_info.h"
 
-#include <windows.h>
-
-#include <vector>
+#include <cstdlib>
+#include <string>
 
 namespace solace::environment
 {
@@ -12,38 +11,24 @@ namespace
 {
 std::string read_variable(const std::string& name)
 {
-    const DWORD size = ::GetEnvironmentVariableA(name.c_str(), nullptr, 0);
-    if (size == 0)
+#if defined(_MSC_VER)
+
+    char* buffer = nullptr;
+    std::size_t size = 0;
+    if (_dupenv_s(&buffer, &size, name.c_str()) != 0 || !buffer)
         return {};
-
-    std::vector<char> buffer(size);
-    const DWORD written =
-        ::GetEnvironmentVariableA(name.c_str(), buffer.data(), static_cast<DWORD>(buffer.size()));
-    return written > 0 && written < buffer.size() ? std::string(buffer.data(), written)
-                                                  : std::string{};
-}
-
-std::wstring read_variable(const std::wstring& name)
-{
-    const DWORD size = ::GetEnvironmentVariableW(name.c_str(), nullptr, 0);
-    if (size == 0)
-        return {};
-
-    std::vector<wchar_t> buffer(size);
-    const DWORD written =
-        ::GetEnvironmentVariableW(name.c_str(), buffer.data(), static_cast<DWORD>(buffer.size()));
-    return written > 0 && written < buffer.size() ? std::wstring(buffer.data(), written)
-                                                  : std::wstring{};
+    std::string result(buffer);
+    std::free(buffer);
+    return result;
+#else
+    const char* raw = std::getenv(name.c_str());
+    return raw ? std::string(raw) : std::string{};
+#endif
 }
 } // namespace
 
 std::string value(std::string_view key)
 {
     return read_variable(product_info::environment_prefix + std::string(key));
-}
-
-std::wstring value(std::wstring_view key)
-{
-    return read_variable(product_info::environment_prefix_wide + std::wstring(key));
 }
 } // namespace solace::environment

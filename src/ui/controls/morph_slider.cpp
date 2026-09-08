@@ -1,6 +1,7 @@
 #include "ui/controls/morph_slider.h"
 #include "assets/images.h"
-#include "graphics/dx11_helpers.h"
+#include "graphics/gfx_helpers.h"
+#include "graphics/imgui_impl_bgfx.h"
 #include "ui/foundation/motion/motion.h"
 #include "ui/foundation/primitives.h"
 #include "ui/foundation/theme.h"
@@ -11,229 +12,6 @@ namespace solace::slides
 {
 namespace
 {
-
-constexpr char k_pixel_shader[] = R"HLSL(
-cbuffer Params : register(b0)
-{
-    float4 u_rect;
-    float4 u_card;
-    float4 u_progress;
-    float4 u_look;
-    float4 u_sizes;
-    float4 u_pointer;
-    float4 u_overlay;
-    float4 u_fade;
-};
-
-Texture2D    tCurrent : register(t1);
-Texture2D    tNext    : register(t2);
-SamplerState sSlide   : register(s1);
-
-struct PS_INPUT
-{
-    float4 pos : SV_POSITION;
-    float4 col : COLOR0;
-    float2 uv  : TEXCOORD0;
-};
-
-static const float PI = 3.14159265359;
-
-float hash11(float p)
-{
-    p = frac(p * 0.1031);
-    p *= p + 33.33;
-    p *= p + p;
-    return frac(p);
-}
-
-float hash21(float2 p)
-{
-    float3 p3 = frac(float3(p.x, p.y, p.x) * 0.1031);
-    p3 += dot(p3, p3.yzx + 33.33);
-    return frac((p3.x + p3.y) * p3.z);
-}
-
-float noise(float2 p)
-{
-    float2 i = floor(p);
-    float2 f = frac(p);
-    float2 u = f * f * (3.0 - 2.0 * f);
-    float a = hash21(i);
-    float b = hash21(i + float2(1.0, 0.0));
-    float c = hash21(i + float2(0.0, 1.0));
-    float d = hash21(i + float2(1.0, 1.0));
-    return lerp(lerp(a, b, u.x), lerp(c, d, u.x), u.y);
-}
-
-float fbm(float2 p)
-{
-    float v = 0.0;
-    float a = 0.5;
-    [unroll] for (int i = 0; i < 5; i++)
-    {
-        v += a * noise(p);
-        p *= 2.0;
-        a *= 0.5;
-    }
-    return v;
-}
-
-float2 rot_mul(float a, float2 v)
-{
-    float s = sin(a), c = cos(a);
-    return float2(c * v.x + s * v.y, -s * v.x + c * v.y);
-}
-
-float2 coverUV(float2 uv, float2 res, float2 img)
-{
-    float rA = res.x / max(res.y, 1.0);
-    float iA = img.x / max(img.y, 1.0);
-    float2 s = float2(1.0, 1.0);
-    float ratio = rA / max(iA, 0.0001);
-    if (ratio > 1.0) s.y = 1.0 / ratio;
-    else             s.x = ratio;
-    return (uv - 0.5) * s + 0.5;
-}
-
-float smootherstep(float t)
-{
-    t = saturate(t);
-    return t * t * t * (t * (t * 6.0 - 15.0) + 10.0);
-}
-
-float rounded_box(float2 p, float2 half_size, float r)
-{
-    float2 q = abs(p) - half_size + r;
-    return length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - r;
-}
-
-float2 animated_uv(PS_INPUT input)
-{
-    float2 uResolution = u_rect.zw;
-    float2 local = input.pos.xy - u_rect.xy;
-    float2 vUv = float2(local.x / uResolution.x, 1.0 - local.y / uResolution.y);
-    float2 uv = vUv;
-    uv += float2(sin(u_look.w * 0.25 + uv.y * 4.0),
-        cos(u_look.w * 0.22 + uv.x * 4.0)) * u_look.z * 0.008;
-    return (uv - 0.5) * (1.0 - u_look.z * 0.02 * sin(u_look.w * 0.4)) + 0.5;
-}
-
-float4 finish_pixel(PS_INPUT input, float2 uv, float3 col)
-{
-    float vig = smoothstep(1.25, 0.25, length(uv - 0.5));
-    col = lerp(col, u_overlay.rgb, (1.0 - vig) * 0.28);
-
-    float2 half_size = u_card.zw * 0.5;
-    float2 centre = u_card.xy + half_size;
-    float d = rounded_box(input.pos.xy - centre, half_size, u_pointer.z);
-    float inside = 1.0 - smoothstep(-0.75, 0.75, d);
-
-    float cover = 0.0;
-    if (u_fade.x > 0.5) cover = max(cover, 1.0 - smootherstep((input.pos.x - u_rect.x) / u_fade.x));
-    if (u_fade.y > 0.5) cover = max(cover, 1.0 - smootherstep((input.pos.y - u_rect.y) / u_fade.y));
-    if (u_fade.z > 0.5) cover = max(cover, 1.0 - smootherstep(((u_rect.y + u_rect.w) - input.pos.y) / u_fade.z));
-
-    float a = inside * (1.0 - cover) * u_pointer.w * input.col.a;
-    if (a <= 0.002)
-        discard;
-
-    return float4(col, a);
-}
-
-float4 main(PS_INPUT input) : SV_Target
-{
-    float  uProgress   = u_progress.x;
-    float  uDir        = u_progress.y;
-    int    uMode       = (int)u_progress.z;
-    float  uIntensity  = u_progress.w;
-    float  uScale      = u_look.x;
-    float  uAberration = u_look.y;
-    float  uTime       = u_look.w;
-    float2 uResolution = u_rect.zw;
-    float2 uPointer    = u_pointer.xy;
-    float2 uv = animated_uv(input);
-
-    float p = clamp(uProgress, 0.0, 1.0);
-    float env = sin(p * PI);
-    float2 uvC = uv;
-    float2 uvN = uv;
-    float m = smoothstep(0.0, 1.0, p);
-
-    if (uMode == 3)
-    {
-        float2 c = uv - 0.5;
-        float r = length(c);
-        float ang = env * uIntensity * 3.5 * (1.0 - r);
-        uvC = rot_mul(ang, c) + 0.5;
-        uvN = rot_mul(-ang, c) + 0.5;
-        m = smoothstep(0.0, 1.0, p);
-    }
-    else if (uMode == 1)
-    {
-        float d = distance(uv, uPointer);
-        float ring = p * 1.6;
-        float wave = sin((d - ring) * 30.0) * env;
-        float2 dir = normalize(uv - uPointer + 1e-4);
-        float2 disp = dir * wave * uIntensity * 0.25;
-        uvC = uv + disp;
-        uvN = uv + disp * 0.6;
-        m = 1.0 - smoothstep(ring - 0.03, ring + 0.03, d);
-    }
-    else if (uMode == 2)
-    {
-        float slices = 14.0;
-        float row = floor(uv.y * slices);
-        float rnd = hash11(row);
-        float2 disp = float2((rnd - 0.5) * env * uIntensity * 0.6, 0.0);
-        uvC = uv + disp;
-        uvN = uv + disp;
-        float localX = uDir > 0.0 ? uv.x : 1.0 - uv.x;
-        float th = p * 1.5 - 0.25 + (rnd - 0.5) * 0.25;
-        m = 1.0 - smoothstep(th - 0.06, th + 0.06, localX);
-    }
-    else
-    {
-        float nn = fbm(uv * uScale + uTime * 0.03);
-        float warp = fbm(uv * uScale * 1.7 - uTime * 0.02);
-        float2 g = float2(nn, warp) - 0.5;
-        uvC = uv + g * uIntensity * 0.5 * p;
-        uvN = uv - g * uIntensity * 0.5 * (1.0 - p);
-        m = smoothstep(nn - 0.15, nn + 0.15, p);
-    }
-
-    float2 sC = coverUV(uvC, uResolution, u_sizes.xy);
-    float2 sN = coverUV(uvN, uResolution, u_sizes.zw);
-    float ca = uAberration * env * 0.03;
-    float3 colC = float3(
-        tCurrent.SampleLevel(sSlide, sC + float2(ca, 0.0), 0).r,
-        tCurrent.SampleLevel(sSlide, sC, 0).g,
-        tCurrent.SampleLevel(sSlide, sC - float2(ca, 0.0), 0).b);
-    float3 colN = float3(
-        tNext.SampleLevel(sSlide, sN + float2(ca, 0.0), 0).r,
-        tNext.SampleLevel(sSlide, sN, 0).g,
-        tNext.SampleLevel(sSlide, sN - float2(ca, 0.0), 0).b);
-
-    return finish_pixel(input, uv, lerp(colC, colN, m));
-}
-
-float4 main_settled(PS_INPUT input) : SV_Target
-{
-    // Completion guarantees progress == 1 and current == next. The aberration
-    // envelope is therefore zero, so two RGB samples preserve the settled melt.
-    float2 uv = animated_uv(input);
-    float nn = fbm(uv * u_look.x + u_look.w * 0.03);
-    float warp = fbm(uv * u_look.x * 1.7 - u_look.w * 0.02);
-    float2 g = float2(nn, warp) - 0.5;
-    float2 uvC = uv + g * u_progress.w * 0.5;
-    float m = smoothstep(nn - 0.15, nn + 0.15, 1.0);
-    float2 sC = coverUV(uvC, u_rect.zw, u_sizes.xy);
-    float2 sN = coverUV(uv, u_rect.zw, u_sizes.xy);
-    float3 colC = tCurrent.SampleLevel(sSlide, sC, 0).rgb;
-    float3 colN = tCurrent.SampleLevel(sSlide, sN, 0).rgb;
-
-    return finish_pixel(input, uv, lerp(colC, colN, m));
-}
-)HLSL";
 
 struct constants
 {
@@ -250,13 +28,13 @@ struct constants
 struct render_command
 {
     constants values{};
-    ID3D11ShaderResourceView* current = nullptr;
-    ID3D11ShaderResourceView* next = nullptr;
+    bgfx::TextureHandle current = BGFX_INVALID_HANDLE;
+    bgfx::TextureHandle next = BGFX_INVALID_HANDLE;
     bool settled_melt = false;
 };
 
-dx11::pixel_shader_pass g_transition_shader;
-dx11::pixel_shader_pass g_settled_shader;
+gfx::pixel_shader_pass g_transition_shader;
+gfx::pixel_shader_pass g_settled_shader;
 
 struct slider_state
 {
@@ -299,12 +77,11 @@ void callback(const ImDrawList*, const ImDrawCmd* cmd)
 
     render_command command{};
     std::memcpy(&command, cmd->UserCallbackData, sizeof(command));
-    const dx11::pixel_shader_pass& shader =
-        command.settled_melt ? g_settled_shader : g_transition_shader;
+    gfx::pixel_shader_pass& shader = command.settled_melt ? g_settled_shader : g_transition_shader;
     if (!shader.upload_constants(&command.values, sizeof(command.values)))
         return;
 
-    ID3D11ShaderResourceView* views[2] = {command.current, command.next};
+    const bgfx::TextureHandle views[2] = {command.current, command.next};
     shader.bind(views, command.settled_melt ? 1u : 2u);
 }
 
@@ -318,19 +95,17 @@ void set_colour(float out[4], ImU32 col)
 }
 } // namespace
 
-bool morph_slider_init(ID3D11Device* device, ID3D11DeviceContext* context)
+bool morph_slider_init()
 {
     if (g_transition_shader.ready() && g_settled_shader.ready())
         return true;
 
     g_transition_shader.reset();
     g_settled_shader.reset();
-    if (!g_transition_shader.initialize(device, context, k_pixel_shader, sizeof(k_pixel_shader) - 1,
-                                        "morph slider transition shader", sizeof(constants),
-                                        true) ||
-        !g_settled_shader.initialize(device, context, k_pixel_shader, sizeof(k_pixel_shader) - 1,
-                                     "morph slider settled shader", sizeof(constants), true,
-                                     "main_settled"))
+    if (!g_transition_shader.initialize("fs_morph_slider", "morph slider transition shader",
+                                        sizeof(constants), /*sampler_count=*/2) ||
+        !g_settled_shader.initialize("fs_morph_slider_settled", "morph slider settled shader",
+                                     sizeof(constants), /*sampler_count=*/1))
     {
         g_transition_shader.reset();
         g_settled_shader.reset();
@@ -466,8 +241,8 @@ void morph_slider(ImDrawList* dl, const ImRect& rect, const ImRect& card, float 
     const images::texture& tn = slides[ImClamp(s.next, 0, count - 1)];
 
     render_command command{};
-    command.current = reinterpret_cast<ID3D11ShaderResourceView*>(static_cast<intptr_t>(tc.id));
-    command.next = reinterpret_cast<ID3D11ShaderResourceView*>(static_cast<intptr_t>(tn.id));
+    command.current = imgui_bgfx::from_texture_id(tc.id);
+    command.next = imgui_bgfx::from_texture_id(tn.id);
     constants& values = command.values;
 
     values.rect[0] = rect.Min.x;

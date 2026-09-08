@@ -2,9 +2,6 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 
-struct ID3D11Device;
-struct ID3D11DeviceContext;
-
 namespace solace::slides
 {
 enum morph_transition
@@ -61,7 +58,7 @@ struct morph_slider_status
 
 const morph_slider_status& morph_slider_state();
 
-[[nodiscard]] bool morph_slider_init(ID3D11Device* device, ID3D11DeviceContext* context);
+[[nodiscard]] bool morph_slider_init();
 void morph_slider_shutdown();
 
 void morph_slider(ImDrawList* draw_list, const ImRect& rect, const ImRect& card,

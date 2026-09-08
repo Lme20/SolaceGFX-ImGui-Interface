@@ -8,9 +8,11 @@
 #include "core/environment.h"
 #include "core/product_info.h"
 #include "generated/fonts/geist_data.h"
+#include "graphics/imgui_impl_bgfx.h"
 #include "graphics/snapshot.h"
-#include "platform/d3d11_renderer.h"
-#include "platform/win32_window.h"
+#include "platform/bgfx_renderer.h"
+#include "platform/glfw_window.h"
+#include "platform/macos.h"
 #include "ui/controls/morph_slider.h"
 #include "ui/controls/widgets.h"
 #include "ui/effects/glass_cursor.h"
@@ -21,25 +23,21 @@
 #include "ui/screens/search_overlay.h"
 #include "ui/screens/shell_menus.h"
 
-#include "imgui_impl_dx11.h"
-#include "imgui_impl_win32.h"
+#include "imgui_impl_glfw.h"
+#include <GLFW/glfw3.h>
 
-#include <array>
+#include <chrono>
 #include <optional>
 #include <string>
-
-extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND window, UINT message,
-                                                             WPARAM w_param, LPARAM l_param);
+#include <thread>
 
 namespace solace::runtime
 {
 namespace
 {
-void set_ui_dpi(UINT dpi, bool rebuild_fonts)
+void set_ui_scale(float scale, bool rebuild_fonts)
 {
-    const UINT safe_dpi = dpi > 0 ? dpi : USER_DEFAULT_SCREEN_DPI;
-    ui_runtime::set_scale(
-        static_cast<float>(safe_dpi) / static_cast<float>(USER_DEFAULT_SCREEN_DPI), rebuild_fonts);
+    ui_runtime::set_scale(scale > 0.f ? scale : 1.f, rebuild_fonts);
 }
 
 void warm_fonts()
@@ -52,53 +50,27 @@ void warm_fonts()
     fonts.get(geist_semibold, 20);
 }
 
-std::optional<LRESULT> handle_window_message(void*, HWND window, UINT message, WPARAM w_param,
-                                             LPARAM l_param)
+bool escape_closes_app()
 {
-    if (ImGui_ImplWin32_WndProcHandler(window, message, w_param, l_param))
-        return static_cast<LRESULT>(true);
-
-    switch (message)
-    {
-    case WM_DPICHANGED:
-        set_ui_dpi(static_cast<UINT>(HIWORD(w_param)), true);
-        break;
-
-    case WM_SETCURSOR:
-        if (LOWORD(l_param) == HTCLIENT && glass::enabled() && glass::cursor_live())
-        {
-            ::SetCursor(nullptr);
-            return static_cast<LRESULT>(TRUE);
-        }
-        break;
-
-    case WM_KEYDOWN:
-        if (w_param == VK_ESCAPE && !solace::morphing_search_open() && !solace::overlay_open() &&
-            !solace::target_menu_open() && !solace::profile_menu_open() &&
-            !solace::notifications_open())
-        {
-            ::PostMessageW(window, WM_CLOSE, 0, 0);
-            return static_cast<LRESULT>(0);
-        }
-        break;
-    }
-    return std::nullopt;
+    return !solace::morphing_search_open() && !solace::overlay_open() &&
+           !solace::target_menu_open() && !solace::profile_menu_open() &&
+           !solace::notifications_open();
 }
 
 class imgui_session final
 {
   public:
-    imgui_session() = default;
     ~imgui_session()
     {
         shutdown();
     }
-
+    imgui_session() = default;
     imgui_session(const imgui_session&) = delete;
     imgui_session& operator=(const imgui_session&) = delete;
 
-    [[nodiscard]] bool initialize(HWND window, ID3D11Device* device, ID3D11DeviceContext* context)
+    [[nodiscard]] bool initialize(GLFWwindow* window)
     {
+        window_ = window;
         IMGUI_CHECKVERSION();
         ImGui::CreateContext();
         context_created_ = true;
@@ -112,33 +84,50 @@ class imgui_session final
         ImGui::StyleColorsDark();
         ImGui::GetStyle().CircleTessellationMaxError = 0.10f;
 
-        win32_initialized_ = ImGui_ImplWin32_Init(window);
-        if (!win32_initialized_)
+        platform_initialized_ = ImGui_ImplGlfw_InitForOther(window, true);
+        if (!platform_initialized_)
             return false;
 
-        dx11_initialized_ = ImGui_ImplDX11_Init(device, context);
-        return dx11_initialized_;
+        renderer_initialized_ =
+            imgui_bgfx::init(platform::k_view_ui_first, platform::k_view_ui_last);
+        return renderer_initialized_;
     }
 
-    void new_frame() const
+    void new_frame(platform::client_extent fb) const
     {
-        ImGui_ImplDX11_NewFrame();
-        ImGui_ImplWin32_NewFrame();
+        imgui_bgfx::new_frame();
+        ImGui_ImplGlfw_NewFrame();
+
+        ImGuiIO& io = ImGui::GetIO();
+
+        const float sx = io.DisplaySize.x > 0.f ? (float)fb.width / io.DisplaySize.x : 1.f;
+        const float sy = io.DisplaySize.y > 0.f ? (float)fb.height / io.DisplaySize.y : 1.f;
+        if (window_)
+        {
+            double cx = 0, cy = 0;
+            glfwGetCursorPos(window_, &cx, &cy);
+            io.AddMousePosEvent((float)cx * sx, (float)cy * sy);
+        }
+
+        io.DisplaySize = ImVec2((float)fb.width, (float)fb.height);
+        io.DisplayFramebufferScale = ImVec2(1.f, 1.f);
+
         ImGui::NewFrame();
     }
 
   private:
     void shutdown() noexcept
     {
-        if (dx11_initialized_)
+        if (renderer_initialized_)
         {
-            ImGui_ImplDX11_Shutdown();
-            dx11_initialized_ = false;
+            imgui_bgfx::shutdown();
+            renderer_initialized_ = false;
         }
-        if (win32_initialized_)
+        if (platform_initialized_)
         {
-            ImGui_ImplWin32_Shutdown();
-            win32_initialized_ = false;
+            ImGui_ImplGlfw_Shutdown();
+            platform_initialized_ = false;
+            window_ = nullptr;
         }
         if (context_created_)
         {
@@ -147,10 +136,8 @@ class imgui_session final
             context_created_ = false;
         }
     }
-
-    bool context_created_ = false;
-    bool win32_initialized_ = false;
-    bool dx11_initialized_ = false;
+    GLFWwindow* window_ = nullptr;
+    bool context_created_ = false, platform_initialized_ = false, renderer_initialized_ = false;
 };
 
 class ui_services final
@@ -161,17 +148,15 @@ class ui_services final
     {
         shutdown();
     }
-
     ui_services(const ui_services&) = delete;
     ui_services& operator=(const ui_services&) = delete;
 
-    void initialize(const platform::d3d11_renderer& renderer)
+    void initialize()
     {
         active_ = true;
-
         const std::string theme = environment::value("THEME");
         if (!theme.empty())
-            solace::set_dark(_stricmp(theme.c_str(), "light") != 0);
+            solace::set_dark(!(theme == "light" || theme == "Light" || theme == "LIGHT"));
 
         fonts.install_kerning();
         warm_fonts();
@@ -181,18 +166,14 @@ class ui_services final
         slides.aspect = 416.f / 650.f;
         slides.radius_ratio = 0.f;
         slides.saturate = 1.f;
-        images::load_folder(asset_io::asset_directory(L"slides", L"SLIDES"), slides);
+        images::load_folder(asset_io::asset_directory("slides", "SLIDES"), slides);
 
-        const bool slider_initialized =
-            slides::morph_slider_init(renderer.device(), renderer.context());
-        const bool panel_initialized =
-            solace::rounded_panel::init(renderer.device(), renderer.context());
-        const bool cursor_initialized = glass::cursor_init(renderer.device(), renderer.context());
-
-        avatars::load(asset_io::asset_directory(L"avatars", L"AVATARS"),
-                      asset_io::asset_directory(L"logos", L"LOGOS"),
-                      asset_io::asset_directory(L"brands", L"BRANDS"), renderer.device(),
-                      renderer.context());
+        const bool slider_initialized = slides::morph_slider_init();
+        const bool panel_initialized = solace::rounded_panel::init();
+        const bool cursor_initialized = glass::cursor_init();
+        avatars::load(asset_io::asset_directory("avatars", "AVATARS"),
+                      asset_io::asset_directory("logos", "LOGOS"),
+                      asset_io::asset_directory("brands", "BRANDS"));
 
         if (!slider_initialized)
             diagnostics::warning("ui", "Morph slider shader unavailable; slides disabled.");
@@ -205,16 +186,17 @@ class ui_services final
             ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     }
 
-    void begin_frame(const platform::d3d11_renderer& renderer) const
+    void begin_frame(const platform::bgfx_renderer& renderer) const
     {
-        snapshot::attach(renderer.device(), renderer.context(), renderer.swap_chain());
+        snapshot::attach(renderer.scene_texture(), renderer.width(), renderer.height(),
+                         platform::k_view_composite);
         fonts.update();
-        images::update(renderer.device(), renderer.context());
+        images::update();
     }
 
-    void after_render(const platform::d3d11_renderer& renderer) const
+    void after_render() const
     {
-        snapshot::poll(renderer.device(), renderer.context(), renderer.swap_chain());
+        snapshot::poll();
     }
 
   private:
@@ -222,7 +204,6 @@ class ui_services final
     {
         if (!active_)
             return;
-
         images::shutdown();
         glass::cursor_shutdown();
         solace::rounded_panel::shutdown();
@@ -231,149 +212,159 @@ class ui_services final
         snapshot::shutdown();
         active_ = false;
     }
-
     bool active_ = false;
 };
 
 void draw_cursor()
 {
-    const ImVec2 display = ImGui::GetIO().DisplaySize;
-    glass::cursor_options options = glass::settings();
+    /* ImGuiIO& io = ImGui::GetIO();
+    if (io.MousePos.x < -FLT_MAX * 0.5f)
+        return;
 
-    glass::cursor(ImGui::GetForegroundDrawList(), ImRect(ImVec2(0.f, 0.f), display), options);
+    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    const ImU32 fill = solace::is_dark() ? IM_COL32(255, 255, 255, 255) : IM_COL32(0, 0, 0, 255);
+    const ImU32 outline = solace::is_dark() ? IM_COL32(0, 0, 0, 160) : IM_COL32(255, 255, 255, 160);
+
+    const float r = px(5.f);
+    dl->AddCircleFilled(io.MousePos, r, fill);
+    dl->AddCircle(io.MousePos, r, outline, 0, px(1.f));*/
 }
 
-void drag_host_window(HWND window)
+// Replaces GetCursorPos/GetWindowRect/SetWindowPos. GLFW positions are screen coords.
+void drag_host_window(GLFWwindow* window)
 {
     static bool dragging = false;
-    static POINT drag_start_cursor{};
-    static RECT drag_start_rect{};
+    static double start_cx = 0, start_cy = 0;
+    static int start_wx = 0, start_wy = 0;
 
-    const bool can_start_drag = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) &&
-                                !ImGui::IsAnyItemHovered() && !ImGui::IsAnyItemActive();
-    if (can_start_drag && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+    const bool can_start = ImGui::IsWindowHovered(ImGuiHoveredFlags_AnyWindow) &&
+                           !ImGui::IsAnyItemHovered() && !ImGui::IsAnyItemActive();
+    if (can_start && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
     {
         dragging = true;
-        ::GetCursorPos(&drag_start_cursor);
-        ::GetWindowRect(window, &drag_start_rect);
+        glfwGetCursorPos(window, &start_cx, &start_cy); // window-relative
+        glfwGetWindowPos(window, &start_wx, &start_wy);
     }
-
     if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
         dragging = false;
     if (!dragging)
         return;
 
-    POINT cursor{};
-    ::GetCursorPos(&cursor);
-    ::SetWindowPos(window, nullptr, drag_start_rect.left + (cursor.x - drag_start_cursor.x),
-                   drag_start_rect.top + (cursor.y - drag_start_cursor.y), 0, 0,
-                   SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    double cx = 0, cy = 0;
+    glfwGetCursorPos(window, &cx, &cy);
+    int wx = 0, wy = 0;
+    glfwGetWindowPos(window, &wx, &wy);
+    // cursor is window-relative, so the delta must be taken against the window's live position
+    glfwSetWindowPos(window, wx + static_cast<int>(cx - start_cx),
+                     wy + static_cast<int>(cy - start_cy));
 }
 
-void sync_host_size(const platform::win32_window& window)
+void sync_host_size(const platform::glfw_window& window)
 {
-    const int width =
-        ui_runtime::host_size.x > 1.f ? static_cast<int>(ui_runtime::host_size.x + 0.5f) : 1;
-    const int height =
-        ui_runtime::host_size.y > 1.f ? static_cast<int>(ui_runtime::host_size.y + 0.5f) : 1;
-    window.set_client_size(
-        platform::client_extent{static_cast<UINT>(width), static_cast<UINT>(height)});
+    const auto w = ui_runtime::host_size.x > 1.f
+                       ? static_cast<std::uint32_t>(ui_runtime::host_size.x + 0.5f)
+                       : 1u;
+    const auto h = ui_runtime::host_size.y > 1.f
+                       ? static_cast<std::uint32_t>(ui_runtime::host_size.y + 0.5f)
+                       : 1u;
+    window.set_framebuffer_size({w, h});
 }
+
+// void sync_cursor_visibility(const platform::glfw_window& window)
+// {
+// window.hide_cursor(ImGui::GetIO().WantCaptureMouse);
+// }
 } // namespace
 
 int run_desktop_app()
 {
-    ImGui_ImplWin32_EnableDpiAwareness();
-    const UINT initial_dpi = ::GetDpiForSystem();
-    set_ui_dpi(initial_dpi, false);
+    platform::window_config config;
+    config.title = product_info::window_title;
 
-    platform::window_config window_config;
-    window_config.class_name = product_info::window_class;
-    window_config.title = product_info::window_title;
-
-    platform::win32_window window;
-    if (!window.create(window_config, initial_dpi, handle_window_message))
+    platform::glfw_window window;
+    if (!window.create(config))
     {
-        diagnostics::error("window", "Failed to create the Win32 host window.",
-                           static_cast<long>(::GetLastError()));
+        diagnostics::error("window", "Failed to create the GLFW host window.");
         return diagnostics::to_process_exit_code(diagnostics::exit_code::window_initialization);
     }
+    set_ui_scale(window.content_scale(), false);
 
-    platform::d3d11_renderer renderer;
-    if (!renderer.initialize(window.native_handle()))
+    const auto dbg_fb = window.framebuffer_size();
+    int dbg_w = 0, dbg_h = 0;
+    glfwGetWindowSize(window.handle(), &dbg_w, &dbg_h);
+    diagnostics::info("dpi",
+                      ("window=" + std::to_string(dbg_w) + "x" + std::to_string(dbg_h) +
+                       " fb=" + std::to_string(dbg_fb.width) + "x" + std::to_string(dbg_fb.height) +
+                       " content_scale=" + std::to_string(window.content_scale()))
+                          .c_str());
+
+    const platform::client_extent fb = window.framebuffer_size();
+    platform::bgfx_renderer renderer;
+    if (!renderer.initialize(window.native_window_handle(), window.native_display_handle(),
+                             fb.width, fb.height))
     {
-        diagnostics::error("renderer", "Failed to initialize Direct3D 11.",
-                           static_cast<long>(renderer.last_error()));
+        diagnostics::error("renderer", "Failed to initialize bgfx.");
         return diagnostics::to_process_exit_code(diagnostics::exit_code::renderer_initialization);
     }
 
-    window.show();
+#if defined(__APPLE__)
+    platform::make_window_transparent(window.native_window_handle());
+#endif
 
     imgui_session imgui;
-    if (!imgui.initialize(window.native_handle(), renderer.device(), renderer.context()))
+    if (!imgui.initialize(window.handle()))
     {
-        diagnostics::error("imgui", "Failed to initialize an ImGui platform backend.");
+        diagnostics::error("imgui", "Failed to initialize an ImGui backend.");
         return diagnostics::to_process_exit_code(diagnostics::exit_code::imgui_initialization);
     }
 
     ui_services services;
-    services.initialize(renderer);
+    services.initialize();
+    window.show();
     diagnostics::info("runtime", "Solace started.");
 
     diagnostics::exit_code exit_code = diagnostics::exit_code::success;
-    while (window.pump_messages())
+    while (window.pump_events())
     {
-        const HRESULT visibility = renderer.test_occlusion();
-        if (visibility == DXGI_STATUS_OCCLUDED)
+        if (window.iconified())
         {
-            ::Sleep(10);
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
             continue;
         }
-        if (FAILED(visibility))
-        {
-            diagnostics::error("renderer", "Swap-chain visibility test failed.",
-                               static_cast<long>(visibility));
-            exit_code = diagnostics::exit_code::rendering_failure;
-            break;
-        }
 
-        const std::optional<platform::client_extent> resize = window.take_pending_resize();
-        if (resize && resize->width != 0 && resize->height != 0)
+        if (const auto scale = window.take_pending_scale())
+            set_ui_scale(*scale, true);
+
+        if (const auto resize = window.take_pending_resize();
+            resize && resize->width && resize->height)
         {
-            // Draw commands store raw ImTextureIDs. Release the old backdrop
-            // before the swap-chain buffer and its SRV can be replaced.
             snapshot::invalidate_backdrop();
             if (!renderer.resize(resize->width, resize->height))
             {
-                diagnostics::error("renderer", "Failed to resize the swap chain.",
-                                   static_cast<long>(renderer.last_error()));
+                diagnostics::error("renderer", "Failed to resize the bgfx backbuffer.");
                 exit_code = diagnostics::exit_code::rendering_failure;
                 break;
             }
         }
 
+        renderer.begin_frame();
         services.begin_frame(renderer);
-        imgui.new_frame();
+        imgui.new_frame(window.framebuffer_size());
+
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false) && escape_closes_app())
+            window.request_close();
 
         solace::application::render_frame();
         ui_runtime::collect_animation_states();
         draw_cursor();
-        drag_host_window(window.native_handle());
+        drag_host_window(window.handle());
         sync_host_size(window);
+        // sync_cursor_visibility(window);
 
         ImGui::Render();
-        renderer.clear(std::array<float, 4>{0.f, 0.f, 0.f, 0.f});
-        ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
-
-        services.after_render(renderer);
-        const HRESULT present_result = renderer.present(1);
-        if (FAILED(present_result))
-        {
-            diagnostics::error("renderer", "Failed to present the frame.",
-                               static_cast<long>(present_result));
-            exit_code = diagnostics::exit_code::rendering_failure;
-            break;
-        }
+        imgui_bgfx::render_draw_data(ImGui::GetDrawData());
+        services.after_render();
+        renderer.composite_and_present();
     }
 
     diagnostics::info("runtime", "Solace stopped.");

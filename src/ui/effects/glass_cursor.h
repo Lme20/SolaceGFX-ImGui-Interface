@@ -2,9 +2,6 @@
 #include "imgui.h"
 #include "imgui_internal.h"
 
-struct ID3D11Device;
-struct ID3D11DeviceContext;
-
 namespace solace::glass
 {
 struct cursor_options
@@ -45,7 +42,7 @@ struct cursor_options
     ImVec2 pointer{0.f, 0.f};
 };
 
-[[nodiscard]] bool cursor_init(ID3D11Device* device, ID3D11DeviceContext* context);
+[[nodiscard]] bool cursor_init();
 void cursor_shutdown();
 
 void cursor(ImDrawList* draw_list, const ImRect& viewport,

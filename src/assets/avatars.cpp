@@ -1,10 +1,9 @@
 #include "assets/avatars.h"
 #include "assets/asset_io.h"
-#include "graphics/dx11_helpers.h"
+#include "graphics/gfx_helpers.h"
 
 #include <algorithm>
 #include <cctype>
-#include <cwctype>
 #include <filesystem>
 #include <string>
 #include <utility>
@@ -21,7 +20,7 @@ constexpr int k_size = 128;
 
 struct entry
 {
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
+    gfx::texture srv;
 };
 
 std::vector<entry> g_others;
@@ -30,22 +29,20 @@ std::vector<entry> g_logos;
 struct named
 {
     std::string name;
-    Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
+    gfx::texture srv;
 };
 std::vector<named> g_brands;
 entry g_me;
 
 bool is_png(const std::filesystem::path& path)
 {
-    std::wstring extension = path.extension().wstring();
+    std::string extension = path.extension().string();
     std::transform(extension.begin(), extension.end(), extension.begin(),
-                   [](wchar_t value) { return static_cast<wchar_t>(std::towlower(value)); });
-    return extension == L".png";
+                   [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+    return extension == ".png";
 }
 
-Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> decode(ID3D11Device* device,
-                                                        ID3D11DeviceContext* context,
-                                                        const std::filesystem::path& path)
+gfx::texture decode(const std::filesystem::path& path)
 {
     const std::vector<unsigned char> bytes = asset_io::read_binary(path);
     if (bytes.empty())
@@ -101,24 +98,22 @@ Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> decode(ID3D11Device* device,
     }
     stbi_image_free(pixels);
 
-    return dx11::create_rgba_texture(device, context, out.data(), k_size, k_size);
+    return gfx::create_rgba_texture(out.data(), k_size, k_size);
 }
 } // namespace
 
 void load(const std::filesystem::path& people_directory,
-          const std::filesystem::path& logo_directory, const std::filesystem::path& brand_directory,
-          ID3D11Device* device, ID3D11DeviceContext* context)
+          const std::filesystem::path& logo_directory, const std::filesystem::path& brand_directory)
 {
-    if (!device || !context || g_me.srv || !g_others.empty() || !g_logos.empty() ||
-        !g_brands.empty())
+    if (g_me.srv.valid() || !g_others.empty() || !g_logos.empty() || !g_brands.empty())
         return;
 
     if (!people_directory.empty())
     {
         for (const std::filesystem::path& path : asset_io::image_files(people_directory))
         {
-            auto view = decode(device, context, path);
-            if (!view)
+            gfx::texture view = decode(path);
+            if (!view.valid())
                 continue;
 
             std::string name = asset_io::stem_utf8(path);
@@ -134,7 +129,7 @@ void load(const std::filesystem::path& people_directory,
     if (!logo_directory.empty())
     {
         for (const std::filesystem::path& path : asset_io::image_files(logo_directory))
-            if (auto view = decode(device, context, path))
+            if (gfx::texture view = decode(path); view.valid())
                 g_logos.push_back(entry{std::move(view)});
     }
 
@@ -144,8 +139,7 @@ void load(const std::filesystem::path& people_directory,
         {
             if (!is_png(path))
                 continue;
-
-            if (auto view = decode(device, context, path))
+            if (gfx::texture view = decode(path); view.valid())
                 g_brands.push_back(named{asset_io::stem_utf8(path), std::move(view)});
         }
     }
@@ -153,7 +147,7 @@ void load(const std::filesystem::path& people_directory,
 
 void shutdown()
 {
-    g_me.srv.Reset();
+    g_me.srv.reset();
     g_brands.clear();
     g_others.clear();
     g_logos.clear();
@@ -161,7 +155,7 @@ void shutdown()
 
 ImTextureID me()
 {
-    return g_me.srv ? reinterpret_cast<ImTextureID>(g_me.srv.Get()) : ImTextureID_Invalid;
+    return g_me.srv.id(); // returns ImTextureID_Invalid when not valid
 }
 
 namespace
@@ -170,10 +164,9 @@ ImTextureID pick(const std::vector<entry>& set, int index)
 {
     if (set.empty())
         return ImTextureID_Invalid;
-
     const int count = (int)set.size();
     const int wrapped = ((index % count) + count) % count;
-    return reinterpret_cast<ImTextureID>(set[wrapped].srv.Get());
+    return set[wrapped].srv.id();
 }
 } // namespace
 
@@ -191,7 +184,7 @@ ImTextureID brand(const char* name)
     if (name)
         for (const named& b : g_brands)
             if (b.name == name)
-                return reinterpret_cast<ImTextureID>(b.srv.Get());
+                return b.srv.id();
     return ImTextureID_Invalid;
 }
 
