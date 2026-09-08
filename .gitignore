@@ -1,6 +1,9 @@
 # Build output
 /Release/
 /Debug/
+/Build/
+tools/shaderc-build/
+tools/bin/
 /x64/
 *.obj
 *.pdb
@@ -15,3 +18,4 @@
 
 # Optional generated reports
 /artifacts/
+

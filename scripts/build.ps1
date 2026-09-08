@@ -3,6 +3,8 @@ param(
     [ValidateSet("Debug", "Release")]
     [string] $Configuration = "Release",
 
+    [string] $BuildDirectory = "build",
+
     [switch] $Rebuild,
     [switch] $Run,
     [switch] $StopRunning
@@ -10,31 +12,29 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
+
 $repositoryRoot = Split-Path -Parent $PSScriptRoot
-$solutionPath = Join-Path $repositoryRoot "Solace.sln"
-$applicationPath = Join-Path $repositoryRoot "$Configuration\Solace.exe"
-$layoutVerifier = Join-Path $PSScriptRoot "verify-source-layout.ps1"
+$buildPath = Join-Path $repositoryRoot $BuildDirectory
+$applicationPath = Join-Path $buildPath "bin\$Configuration\Solace.exe"
 
-function Find-MSBuild {
-    $command = Get-Command "MSBuild.exe" -ErrorAction SilentlyContinue
-    if ($command) {
-        return $command.Source
-    }
+function Find-CMake {
+    $command = Get-Command "cmake.exe" -ErrorAction SilentlyContinue
+    if ($command) { return $command.Source }
 
+    # Visual Studio bundles CMake; locate it through vswhere as a fallback.
     $installerRoot = [Environment]::GetFolderPath([Environment+SpecialFolder]::ProgramFilesX86)
     $vswhere = Join-Path $installerRoot "Microsoft Visual Studio\Installer\vswhere.exe"
     if (Test-Path -LiteralPath $vswhere) {
         $installation = & $vswhere -latest -products * `
-            -requires Microsoft.Component.MSBuild -property installationPath
+            -requires Microsoft.VisualStudio.Component.VC.CMake.Project -property installationPath
         if ($LASTEXITCODE -eq 0 -and $installation) {
-            $candidate = Join-Path $installation.Trim() "MSBuild\Current\Bin\MSBuild.exe"
-            if (Test-Path -LiteralPath $candidate) {
-                return $candidate
-            }
+            $candidate = Join-Path $installation.Trim() `
+                "Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe"
+            if (Test-Path -LiteralPath $candidate) { return $candidate }
         }
     }
 
-    throw "MSBuild.exe was not found. Install Visual Studio 2022 with Desktop development with C++."
+    throw "cmake.exe was not found. Install CMake 3.24+ or the Visual Studio 'C++ CMake tools' component."
 }
 
 if ($StopRunning -and (Test-Path -LiteralPath $applicationPath)) {
@@ -47,18 +47,20 @@ if ($StopRunning -and (Test-Path -LiteralPath $applicationPath)) {
         ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 }
 
-$msbuild = Find-MSBuild
-$target = if ($Rebuild) { "Rebuild" } else { "Build" }
+$cmake = Find-CMake
 
-Write-Host "Verifying source layout..."
-& $layoutVerifier
-
-Write-Host "Building Solace ($Configuration|x64)..."
-& $msbuild $solutionPath "/t:$target" "/p:Configuration=$Configuration" "/p:Platform=x64" `
-    "/m" "/nologo" "/v:minimal"
-if ($LASTEXITCODE -ne 0) {
-    throw "MSBuild failed with exit code $LASTEXITCODE."
+if ($Rebuild -and (Test-Path -LiteralPath $buildPath)) {
+    Write-Host "Removing $buildPath..."
+    Remove-Item -LiteralPath $buildPath -Recurse -Force
 }
+
+Write-Host "Configuring (Visual Studio 2022, x64)..."
+& $cmake -S $repositoryRoot -B $buildPath -G "Visual Studio 17 2022" -A x64
+if ($LASTEXITCODE -ne 0) { throw "CMake configure failed with exit code $LASTEXITCODE." }
+
+Write-Host "Building Solace ($Configuration)..."
+& $cmake --build $buildPath --config $Configuration --parallel
+if ($LASTEXITCODE -ne 0) { throw "CMake build failed with exit code $LASTEXITCODE." }
 
 if ($Run) {
     if (-not (Test-Path -LiteralPath $applicationPath)) {
